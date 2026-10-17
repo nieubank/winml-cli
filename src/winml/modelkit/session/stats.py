@@ -34,6 +34,9 @@ class PerfStats:
 
     _samples: list[float] = field(default_factory=list)
     warmup: int = 0  # Exclude first N samples from calculations
+    # Optional companion series timed over a wider caller boundary, such as
+    # NumPy inputs to NumPy outputs around the same calls.
+    end_to_end: PerfStats | None = None
 
     def record(self, func: Callable[[], T]) -> T:
         """Execute func, record timing, return result unchanged.
@@ -101,6 +104,9 @@ class PerfStats:
     def percentile(self, p: float) -> float:
         """Get p-th percentile (0-100), after warmup exclusion.
 
+        Uses linear interpolation between the closest ranks (the NumPy
+        default), so ``percentile(50)`` is the true median for even counts.
+
         Args:
             p: Percentile value between 0 and 100.
 
@@ -111,9 +117,11 @@ class PerfStats:
         if not samples:
             return 0.0
         sorted_samples = sorted(samples)
-        idx = int(len(sorted_samples) * p / 100)
-        idx = min(idx, len(sorted_samples) - 1)
-        return sorted_samples[idx]
+        rank = (len(sorted_samples) - 1) * min(max(p, 0.0), 100.0) / 100
+        lower = int(rank)
+        upper = min(lower + 1, len(sorted_samples) - 1)
+        fraction = rank - lower
+        return sorted_samples[lower] + (sorted_samples[upper] - sorted_samples[lower]) * fraction
 
     @property
     def p50_ms(self) -> float:

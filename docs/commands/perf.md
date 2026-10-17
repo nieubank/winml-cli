@@ -47,7 +47,7 @@ $ winml perf [options]
 
 ## How it works
 
-`winml perf` loads the model through `WinMLAutoModel` — accepting both HuggingFace IDs and local ONNX files — then generates random input tensors from the model's I/O configuration. It runs the specified number of warm-up iterations (excluded from statistics) followed by the timed iterations, collecting per-sample latency. The final report includes mean, min, max, P50, P90, P95, P99, standard deviation, and throughput in samples per second. When `--monitor` is active, a hardware polling loop runs in parallel and records NPU / GPU utilization, CPU usage, and device memory alongside the timing data.
+`winml perf` loads the model through `WinMLAutoModel` — accepting both HuggingFace IDs and local ONNX files — then generates random input tensors from the model's I/O configuration. It runs the specified number of warm-up iterations (excluded from statistics) followed by the timed iterations, collecting per-sample latency. The final report includes mean, min, max, P50, P90, P95, P99, standard deviation, and throughput in samples per second. Percentiles interpolate linearly between the closest ranks, so P50 is the median. When `--monitor` is active, a hardware polling loop runs in parallel and records NPU / GPU utilization, CPU usage, and device memory alongside the timing data.
 
 The `winml-ort` and `ort-genai` reports include `schema_version: 2` and a
 `benchmark_info.runtime` discriminator. GGUF reports (experimental) use
@@ -466,3 +466,26 @@ See [native host setup and limitations](../../native/dxcgc-perf/README.md).
 The result separates GPU timestamp latency and native host completion latency;
 host latency includes per-iteration CPU input upload and output readback.
 Compilation is excluded. DLLs default to the installed Windows ML Runtime package.
+
+### Comparing with `--runtime winml-runtime`
+
+The two runtimes report different primary intervals. For `winml-runtime`,
+`latency_ms` and `raw_samples_ms` time only `Pipeline.run()`. DXCGC
+`samples.host_ms` spans each call from NumPy inputs to NumPy outputs: output
+allocation, input upload, execution, readback and the copy into caller memory.
+
+For an equal comparison, `winml-runtime` reports also include
+`end_to_end_latency_ms` and `end_to_end_samples_ms`, which time each
+`run()` call from prepared NumPy inputs to NumPy outputs: input and output
+binding, execution, and output publication. Input dtype normalization happens
+before the timer, as the DXCGC worker validates its inputs before timing.
+Compare these with `samples.host_ms`. Both paths perform one host copy per
+input and one per output: the Runtime session binds the caller's input arrays
+and fresh output arrays in place with one `Stage.bind_buffers` call, and
+releases its references to the output arrays after each call so they are freed
+outside the next timed call, as in the DXCGC worker. Projections without
+`bind_buffers` bind each array as a zero-copy tensor instead. When the
+projection has no zero-copy buffer API, or an output shape is dynamic, the
+session falls back to copying through Runtime-owned tensors. Run both paths in
+alternating rounds on an idle machine (`native/dxcgc-perf/compare_sequence.py`
+does this) and compare medians.
