@@ -79,6 +79,9 @@ _TENSOR_DTYPE_TO_NUMPY: dict[str, str] = {
     "UINT64": "uint64",
     "BOOL": "bool",
 }
+_NUMPY_TO_TENSOR_DTYPE: dict[str, str] = {
+    numpy_name: tensor_name for tensor_name, numpy_name in _TENSOR_DTYPE_TO_NUMPY.items()
+}
 
 # ModelKit device class -> WinML Runtime ``ExecutionTargetKind`` member name.
 _DEVICE_TO_KIND_NAME: dict[str, str] = {"cpu": "CPU", "gpu": "GPU", "npu": "NPU"}
@@ -624,6 +627,32 @@ def _resolve_onnx_target(
     return _ResolvedRuntimeTarget(target, device_class, provider_name, adapter)
 
 
+def _zero_copy_tensor(runtime: Any, wr: Any, array: np.ndarray, *, writable: bool) -> Any | None:
+    """Wrap a C-contiguous NumPy array as a Runtime tensor without copying.
+
+    Read-only borrows serve inputs; read-write borrows receive outputs directly.
+    Returns ``None`` when the installed projection predates zero-copy buffers or
+    the dtype has no Runtime mapping, so callers keep the copying APIs.
+    """
+    from_buffer = getattr(runtime, "tensor_from_buffer", None)
+    access_modes = getattr(wr, "TensorAccessMode", None)
+    data_types = getattr(wr, "TensorDataType", None)
+    tensor_name = _NUMPY_TO_TENSOR_DTYPE.get(array.dtype.name)
+    if from_buffer is None or access_modes is None or data_types is None or tensor_name is None:
+        return None
+    data_type = getattr(data_types, tensor_name, None)
+    access = getattr(access_modes, "READWRITE" if writable else "READ", None)
+    if data_type is None or access is None:
+        return None
+    return from_buffer(array, data_type, array.shape, access=access)
+
+
+def _input_tensor(runtime: Any, wr: Any, array: np.ndarray) -> Any:
+    """Bindable input tensor; zero-copy when the projection supports it."""
+    tensor = _zero_copy_tensor(runtime, wr, array, writable=False)
+    return tensor if tensor is not None else runtime.tensor_from_numpy(array)
+
+
 def _bind_inputs(
     runtime: Any,
     wr: Any,
@@ -635,9 +664,10 @@ def _bind_inputs(
 ) -> Any:
     """Bind inputs, preferring name-based ORT bindings.
 
-    Returns the :class:`OrtNamedBindings` handle when the stage is ORT-backed
-    (so outputs can later be fetched by name), else ``None`` after binding by
-    ordinal.
+    Each call binds new tensors over the caller's arrays, so the Runtime stages
+    current contents on every execution. Returns the :class:`OrtNamedBindings`
+    handle when the stage is ORT-backed (so outputs can later be fetched by
+    name), else ``None`` after binding by ordinal.
     """
     named = None
     if use_named_bindings:
@@ -648,11 +678,20 @@ def _bind_inputs(
 
     if named is not None:
         for name in input_names:
-            named.bind_input(name, runtime.tensor_from_numpy(inputs[name]))
+            named.bind_input(name, _input_tensor(runtime, wr, inputs[name]))
         return named
 
+    bind_buffer = getattr(stage, "bind_input_buffer", None)
     for index, name in enumerate(input_names):
-        stage.bind_input(index, runtime.tensor_from_numpy(inputs[name]))
+        array = inputs[name]
+        if callable(bind_buffer):
+            try:
+                bind_buffer(index, array)
+                continue
+            except TypeError:
+                # Unsupported element type for direct binding; copy instead.
+                pass
+        stage.bind_input(index, _input_tensor(runtime, wr, array))
     return None
 
 
@@ -753,6 +792,8 @@ class WinMLRuntimeSession:
         self._selected_provider: str | None = None
         self._is_pinned: bool = False
         self._has_named_bindings = False
+        # Output slots bound to caller-owned arrays by the current call.
+        self._caller_output_count = 0
         self._compiled_artifacts: TemporaryDirectory[str] | None = None
         self._symbolic_dimensions: dict[str, int] = {}
         self._built = False
@@ -970,37 +1011,136 @@ class WinMLRuntimeSession:
                 outputs[name] = self._stage.output(index).to_numpy()
         return outputs
 
+    def _caller_output_arrays(self) -> list[np.ndarray] | None:
+        """Fresh caller-owned output arrays, or ``None`` when shapes are dynamic."""
+        import numpy as np
+
+        assert self._io_config is not None
+        shapes = self._io_config["output_shapes"]
+        if any(dim is None for shape in shapes for dim in shape):
+            return None
+        return [
+            np.empty(shape, dtype=dtype)
+            for shape, dtype in zip(shapes, self._io_config["output_types"], strict=True)
+        ]
+
+    def _bind_caller_outputs(self) -> list[np.ndarray] | None:
+        """Bind fresh caller-owned output arrays that the Runtime writes directly.
+
+        This gives the Runtime path the same copy count as a native host that
+        reads back into caller memory. Returns ``None`` for named ORT bindings,
+        dynamic output shapes, or projections without zero-copy output binding;
+        those use requested Runtime-owned outputs instead.
+        """
+        bind_output = getattr(self._stage, "bind_output", None)
+        if self._has_named_bindings or not callable(bind_output):
+            return None
+        arrays = self._caller_output_arrays()
+        if arrays is None:
+            return None
+        bind_buffer = getattr(self._stage, "bind_output_buffer", None)
+        if callable(bind_buffer):
+            for index, array in enumerate(arrays):
+                bind_buffer(index, array)
+                self._caller_output_count = index + 1
+            return arrays
+
+        tensors = []
+        for array in arrays:
+            tensor = _zero_copy_tensor(self._runtime, self._wr, array, writable=True)
+            if tensor is None:
+                return None
+            tensors.append(tensor)
+        for index, tensor in enumerate(tensors):
+            bind_output(index, tensor)
+            self._caller_output_count = index + 1
+        return arrays
+
+    def _bind_buffers(
+        self, prepared: dict[str, np.ndarray]
+    ) -> tuple[bool, list[np.ndarray] | None]:
+        """Bind inputs and caller-owned outputs in one call when supported.
+
+        Returns whether the call bound the inputs, and the output arrays it
+        bound (``None`` when outputs stay Runtime-owned).
+        """
+        bind_buffers = getattr(self._stage, "bind_buffers", None)
+        if self._has_named_bindings or not callable(bind_buffers):
+            return False, None
+        assert self._io_config is not None
+        inputs = [prepared[name] for name in self._io_config["input_names"]]
+        outputs = self._caller_output_arrays()
+        try:
+            bind_buffers(inputs, outputs or ())
+        except TypeError:
+            # An element type without a host-buffer mapping binds per tensor.
+            return False, None
+        if outputs:
+            self._caller_output_count = len(outputs)
+        return True, outputs
+
     def run(self, inputs: dict[str, Any]) -> dict[str, np.ndarray]:
         """Run one inference and return ``{output_name: ndarray}``.
 
-        Inside a :meth:`perf` window, only ``Pipeline.run`` is timed;
-        input preparation/binding and output read-back are outside the timer.
+        Inside a :meth:`perf` window, each call records two samples: the primary
+        sample times only ``Pipeline.run``, and the end-to-end sample times the
+        call from prepared NumPy inputs to NumPy outputs (binding, execution and
+        output publication; input normalization is excluded). The stage's
+        references to caller-owned output arrays are released after the timed
+        call, so those arrays are freed when the caller drops them rather than
+        inside the next timed call.
         """
         with self._lock:
-            return self._run_locked(inputs)
+            try:
+                return self._run_locked(inputs)
+            finally:
+                self._release_caller_outputs()
+
+    def _release_caller_outputs(self) -> None:
+        """Return caller-bound output slots to Runtime-owned outputs."""
+        count = self._caller_output_count
+        self._caller_output_count = 0
+        request_output = getattr(self._stage, "request_output", None)
+        if not count or not callable(request_output):
+            return
+        try:
+            for index in range(count):
+                request_output(index)
+        except Exception:  # release is best-effort; the next call rebinds
+            logger.debug("Failed to release Runtime outputs", exc_info=True)
 
     def _run_locked(self, inputs: dict[str, Any]) -> dict[str, np.ndarray]:
         if not inputs:
             raise ValueError("inputs cannot be empty")
         self._ensure_built_locked()
         prepared = self._prepare_inputs(inputs)
+        end_to_end = getattr(self._perf_stats, "end_to_end", None)
+        if end_to_end is None:
+            return self._execute(prepared)
+        return end_to_end.record(lambda: self._execute(prepared))
+
+    def _execute(self, prepared: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         assert self._io_config is not None
         input_names = self._io_config["input_names"]
         output_count = len(self._io_config["output_names"])
 
-        named = _bind_inputs(
-            self._runtime,
-            self._wr,
-            self._stage,
-            input_names,
-            prepared,
-            use_named_bindings=self._has_named_bindings,
-        )
+        named = None
+        bound, caller_outputs = self._bind_buffers(prepared)
+        if not bound:
+            named = _bind_inputs(
+                self._runtime,
+                self._wr,
+                self._stage,
+                input_names,
+                prepared,
+                use_named_bindings=self._has_named_bindings,
+            )
+            caller_outputs = self._bind_caller_outputs() if named is None else None
         with _translate_native_errors("run"):
             # Older projections (including 2.7.9) materialize outputs automatically.
             # Newer projections require an explicit request on every execution.
             request_output = getattr(self._stage, "request_output", None)
-            if callable(request_output):
+            if caller_outputs is None and callable(request_output):
                 for index in range(output_count):
                     request_output(index)
             if self._perf_stats is not None:
@@ -1008,6 +1148,8 @@ class WinMLRuntimeSession:
             else:
                 self._pipeline.run()
 
+        if caller_outputs is not None:
+            return dict(zip(self._io_config["output_names"], caller_outputs, strict=True))
         return self._read_outputs(named)
 
     def compile(self) -> None:
@@ -1100,6 +1242,7 @@ class WinMLRuntimeSession:
 
         self._ensure_built()
         stats = PerfStats(warmup=warmup)
+        stats.end_to_end = PerfStats(warmup=warmup)
         self._perf_stats = stats
         try:
             yield PerfContext(stats=stats, monitor=NullEPMonitor())

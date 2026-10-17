@@ -17,6 +17,10 @@ order. Generate model-valid data beforehand. The driver changes only input
 delivery outside the Offline measurement window; production Offline code is
 unchanged. Compare outputs separately from timing. Historical measurements
 must retain their old protocol. The first record is included if warmup is zero.
+The Offline `p50_ms` uses the Runtime report's `end_to_end_samples_ms`, the same
+NumPy-in to NumPy-out interval as Raw `host_ms`; `run_p50_ms` records the
+`Pipeline.run()` median for attribution. Reports without the end-to-end series
+fall back to `raw_samples_ms`.
 
 `winml perf --runtime dxcgc` compiles local MLIR with dxcgc.dll and executes
 through D3D12 in a native host, without the Windows ML Runtime API.

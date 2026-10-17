@@ -636,6 +636,11 @@ class BenchmarkResult:
     # Raw samples (for advanced analysis)
     raw_samples_ms: list[float] = field(default_factory=list)
 
+    # Companion end-to-end series (NumPy inputs to NumPy outputs around each
+    # timed call) for runtimes whose primary samples cover a narrower interval.
+    end_to_end_latency_ms: dict[str, float] | None = None
+    end_to_end_samples_ms: list[float] = field(default_factory=list)
+
     # Throughput
     samples_per_sec: float = 0.0
     batches_per_sec: float = 0.0
@@ -721,6 +726,11 @@ class BenchmarkResult:
             },
             "raw_samples_ms": [round(s, 3) for s in self.raw_samples_ms],
         }
+        if self.end_to_end_latency_ms is not None:
+            result["end_to_end_latency_ms"] = {
+                name: round(value, 3) for name, value in self.end_to_end_latency_ms.items()
+            }
+            result["end_to_end_samples_ms"] = [round(s, 3) for s in self.end_to_end_samples_ms]
         if self.hw_monitor:
             result["hw_monitor"] = self.hw_monitor
         if self.memory_profile:
@@ -1674,6 +1684,24 @@ class PerfBenchmark:
         warmup_samples = stats.all_samples_ms[: self.config.warmup]
         warmup_mean_ms = float(np.mean(warmup_samples)) if warmup_samples else 0.0
 
+        from ..session.stats import PerfStats
+
+        end_to_end = getattr(stats, "end_to_end", None)
+        end_to_end_latency_ms = None
+        end_to_end_samples_ms: list[float] = []
+        if isinstance(end_to_end, PerfStats) and end_to_end.count:
+            end_to_end_samples_ms = end_to_end.samples_ms
+            end_to_end_latency_ms = {
+                "mean": end_to_end.mean_ms,
+                "min": end_to_end.min_ms,
+                "max": end_to_end.max_ms,
+                "p50": end_to_end.p50_ms,
+                "p90": end_to_end.p90_ms,
+                "p95": end_to_end.p95_ms,
+                "p99": end_to_end.p99_ms,
+                "std": float(np.std(end_to_end_samples_ms)),
+            }
+
         return BenchmarkResult(
             config=self.config,
             # Model info
@@ -1694,6 +1722,8 @@ class PerfBenchmark:
             std_ms=std_ms,
             warmup_mean_ms=warmup_mean_ms,
             raw_samples_ms=stats.samples_ms,
+            end_to_end_latency_ms=end_to_end_latency_ms,
+            end_to_end_samples_ms=end_to_end_samples_ms,
             # Throughput
             samples_per_sec=samples_per_sec,
             batches_per_sec=batches_per_sec,
@@ -2155,6 +2185,13 @@ def display_console_report(result: BenchmarkResult, console: SafeConsole) -> Non
     )
 
     console.print(table)
+
+    if isinstance(result.end_to_end_latency_ms, dict):
+        console.print(
+            "  [dim]End-to-end (NumPy in to NumPy out): "
+            f"P50 {result.end_to_end_latency_ms['p50']:.2f} ms, "
+            f"avg {result.end_to_end_latency_ms['mean']:.2f} ms[/dim]"
+        )
 
     if result.warmup_mean_ms > 0:
         console.print(

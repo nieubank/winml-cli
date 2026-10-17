@@ -20,6 +20,23 @@ from pathlib import Path
 import numpy as np
 
 
+# Native host element-type codes (same values as _perf_dxcgc._TYPES).
+_TYPES = {
+    np.dtype("bool"): 1,
+    np.dtype("int8"): 4,
+    np.dtype("int16"): 5,
+    np.dtype("int32"): 6,
+    np.dtype("int64"): 7,
+    np.dtype("uint8"): 10,
+    np.dtype("uint16"): 11,
+    np.dtype("uint32"): 12,
+    np.dtype("uint64"): 13,
+    np.dtype("float64"): 14,
+    np.dtype("float32"): 15,
+    np.dtype("float16"): 16,
+}
+
+
 def main():
     """Run serial paired measurements with a shared input sequence."""
     p = argparse.ArgumentParser()
@@ -62,7 +79,7 @@ def main():
         from winml.modelkit.session.runtime_session import WinMLRuntimeSession
 
         original = WinMLRuntimeSession._prepare_inputs
-        read = WinMLRuntimeSession._read_outputs
+        execute = WinMLRuntimeSession._run_locked
         index = 0
         last = {}
 
@@ -73,13 +90,13 @@ def main():
             index += 1
             return dict(zip(prepared, batch, strict=True))
 
-        def outputs(self, named):
+        def run_locked(self, inputs):
             nonlocal last
-            last = read(self, named)
+            last = execute(self, inputs)
             return last
 
         WinMLRuntimeSession._prepare_inputs = prepare
-        WinMLRuntimeSession._read_outputs = outputs
+        WinMLRuntimeSession._run_locked = run_locked
         perf(
             args=[
                 "-m",
@@ -111,6 +128,7 @@ def main():
         np.savez(a.output / "outputs.npz", **last)
         return
     root = Path(__file__).resolve().parents[2]
+    reverse_types = {value: key for key, value in _TYPES.items()}
     summary = []
     for repeat, order in enumerate((("raw", "offline"), ("offline", "raw"), ("raw", "offline"))):
         for mode in order:
@@ -119,7 +137,7 @@ def main():
             if mode == "raw":
                 for i, array in enumerate(batches[0]):
                     array.tofile(work / f"input-{i}.bin")
-                    dtype = {np.dtype("float32"): 15, np.dtype("float16"): 16}[array.dtype]
+                    dtype = _TYPES[array.dtype]
                     (work / f"input-{i}.txt").write_text(
                         " ".join(map(str, [dtype, array.ndim, *array.shape]))
                     )
@@ -164,16 +182,23 @@ def main():
                 subprocess.run(  # noqa: S603 - explicit local argv, no shell
                     command, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=300
                 )
+            run_samples = None
             if mode == "raw":
                 with (work / "samples.csv").open() as stream:
                     samples = [float(r["host_ms"]) for r in csv.DictReader(stream)]
             else:
-                samples = json.loads((work / "perf.json").read_text(encoding="utf8"))[
-                    "raw_samples_ms"
-                ]
+                report = json.loads((work / "perf.json").read_text(encoding="utf8"))
+                # Raw host samples span NumPy inputs to NumPy outputs, so compare
+                # the Runtime's end-to-end series; Pipeline.run samples are kept
+                # alongside for attribution.
+                run_samples = report["raw_samples_ms"]
+                samples = report.get("end_to_end_samples_ms") or run_samples
             if len(samples) != a.iterations:
                 raise ValueError("Incomplete measurements")
-            summary.append({"round": repeat, "mode": mode, "p50_ms": statistics.median(samples)})
+            entry = {"round": repeat, "mode": mode, "p50_ms": statistics.median(samples)}
+            if run_samples is not None:
+                entry["run_p50_ms"] = statistics.median(run_samples)
+            summary.append(entry)
             (a.output / "summary.json").write_text(json.dumps(summary, indent=2))
     validation = []
     for repeat in range(3):
@@ -190,7 +215,7 @@ def main():
             for spec, key in zip(specs, reference.files, strict=True):
                 value = np.fromfile(
                     work / f"output-{spec[1]}.bin",
-                    dtype={15: np.float32, 16: np.float16}[int(spec[2])],
+                    dtype=reverse_types[int(spec[2])],
                 )
                 if value.size != reference[key].size:
                     raise ValueError("Output size mismatch")

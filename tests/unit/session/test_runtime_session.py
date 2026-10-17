@@ -548,7 +548,7 @@ def timed_runtime(monkeypatch, mlir_target):
 
 
 @pytest.mark.parametrize("named_bindings", [False, True])
-def test_perf_times_only_pipeline_run(timed_runtime, monkeypatch, named_bindings):
+def test_perf_times_pipeline_run_and_end_to_end_call(timed_runtime, monkeypatch, named_bindings):
     session, clock, calls, durations, _phases = timed_runtime
     with session.perf(warmup=1) as ctx:
         session._has_named_bindings = named_bindings
@@ -563,16 +563,21 @@ def test_perf_times_only_pipeline_run(timed_runtime, monkeypatch, named_bindings
             raising=False,
         )
         rng = np.random.default_rng(42)
+        per_call = sum(
+            value for phase, value in durations.items() if phase not in ("build", "prepare")
+        )
         for _ in range(3):
             values = rng.standard_normal((2, 3, 8, 8)).astype(np.float32)
             actual = session.run({"input_0": values})
             np.testing.assert_array_equal(actual["output_0"], np.negative(values))
             assert ctx.stats.all_samples_ms[-1] == pytest.approx(durations["execute"] * 1000)
+            assert ctx.stats.end_to_end.all_samples_ms[-1] == pytest.approx(per_call * 1000)
 
-    assert len(clock.reads) == 2 * ctx.stats.total_count
+    assert len(clock.reads) == 4 * ctx.stats.total_count
     assert ctx.stats.total_count == 3
     assert ctx.stats.count == 2
     assert ctx.stats.mean_ms == pytest.approx(durations["execute"] * 1000)
+    assert ctx.stats.end_to_end.count == 2
     assert calls.count("build") == 1
     assert calls.count("create_tensor") == calls.count("execute")
     assert calls.count("request") == calls.count("execute")
@@ -592,10 +597,12 @@ def test_perf_records_only_successful_pipeline_calls(timed_runtime, monkeypatch,
             with pytest.raises(RuntimeError, match=failure):
                 session.run({"input_0": values})
         assert ctx.stats.total_count == calls.count("execute")
+        assert ctx.stats.end_to_end.total_count == 0
 
         actual = session.run({"input_0": values})
         np.testing.assert_array_equal(actual["output_0"], np.negative(values))
         assert ctx.stats.total_count == calls.count("execute")
+        assert ctx.stats.end_to_end.total_count == 1
 
 
 def test_run_without_perf_does_not_read_clock(timed_runtime):
@@ -606,6 +613,120 @@ def test_run_without_perf_does_not_read_clock(timed_runtime):
 
     np.testing.assert_array_equal(actual["output_0"], np.negative(values))
     assert clock.reads == []
+
+
+class _BorrowedTensor:
+    def __init__(self, array: np.ndarray, data_type: Any, shape: tuple[int, ...], access: Any):
+        self.array = array
+        self.data_type = data_type
+        self.shape = shape
+        self.access = access
+
+
+@pytest.mark.parametrize("binding", ["batch", "buffer", "tensor"])
+@pytest.mark.parametrize("static_outputs", [True, False])
+def test_run_binds_caller_arrays_without_copies(monkeypatch, mlir_target, static_outputs, binding):
+    stage = _Stage()
+    pipeline = _Pipeline()
+    runtime = _Runtime(stage, pipeline)
+    runtime.tensor_from_numpy = Mock(side_effect=AssertionError("copying input path"))
+    buffer_api = binding != "tensor"
+    if buffer_api:
+        runtime.tensor_from_buffer = Mock(side_effect=AssertionError("Tensor object path"))
+    else:
+        runtime.tensor_from_buffer = lambda array, data_type, shape, *, access: _BorrowedTensor(
+            array, data_type, shape, access
+        )
+    bound_outputs: dict[int, _BorrowedTensor] = {}
+    events: list[str] = []
+    if buffer_api:
+
+        def bind_input_buffer(index: int, array: np.ndarray) -> None:
+            stage.bound[index] = _BorrowedTensor(array, "float32-type", array.shape, "read")
+
+        def bind_output_buffer(index: int, array: np.ndarray) -> None:
+            events.append("bind_output")
+            bound_outputs[index] = _BorrowedTensor(array, "float32-type", array.shape, "readwrite")
+
+        monkeypatch.setattr(stage, "bind_input_buffer", bind_input_buffer, raising=False)
+        monkeypatch.setattr(stage, "bind_output_buffer", bind_output_buffer, raising=False)
+
+    if binding == "batch":
+
+        def bind_buffers(inputs: list[np.ndarray], outputs: list[np.ndarray]) -> None:
+            events.append("bind_buffers")
+            for index, array in enumerate(inputs):
+                stage.bound[index] = _BorrowedTensor(array, "float32-type", array.shape, "read")
+            for index, array in enumerate(outputs):
+                bound_outputs[index] = _BorrowedTensor(
+                    array, "float32-type", array.shape, "readwrite"
+                )
+
+        unused = Mock(side_effect=AssertionError("per-buffer binding"))
+        monkeypatch.setattr(stage, "bind_buffers", bind_buffers, raising=False)
+        monkeypatch.setattr(stage, "bind_input_buffer", unused, raising=False)
+        monkeypatch.setattr(stage, "bind_output_buffer", unused, raising=False)
+
+    def bind_output(index: int, tensor: _BorrowedTensor) -> None:
+        events.append("bind_output")
+        bound_outputs[index] = tensor
+
+    def request_output(index: int) -> None:
+        events.append("request_output")
+        bound_outputs.pop(index, None)
+
+    monkeypatch.setattr(stage, "bind_output", bind_output, raising=False)
+    monkeypatch.setattr(stage, "request_output", request_output)
+    monkeypatch.setattr(
+        stage, "output", lambda index: _Tensor(stage.bound[0].array[:, 0, 0, :5].copy())
+    )
+
+    def execute() -> None:
+        events.append("run")
+        pipeline.runs += 1
+        if static_outputs:
+            np.copyto(bound_outputs[0].array, stage.bound[0].array[:, 0, 0, :5])
+
+    monkeypatch.setattr(pipeline, "run", execute)
+    wr = SimpleNamespace(
+        Runtime=lambda: runtime,
+        NotSupportedError=_NotSupportedError,
+        TensorAccessMode=SimpleNamespace(READ="read", READWRITE="readwrite"),
+        TensorDataType=SimpleNamespace(FLOAT32="float32-type"),
+    )
+    monkeypatch.setattr("winml.modelkit.session.runtime_session.import_runtime", lambda: wr)
+    session = WinMLRuntimeSession("model.mlir", ep_device=mlir_target[0], backend="cgc")
+    try:
+        session.compile()
+        if static_outputs:
+            session._io_config["output_shapes"] = [[2, 5]]
+        rng = np.random.default_rng(42)
+        results = []
+        for _ in range(2):
+            values = rng.standard_normal((2, 3, 8, 8)).astype(np.float32)
+            actual = session.run({"input_0": values})
+            assert stage.bound[0].array is values
+            assert stage.bound[0].access == "read"
+            assert stage.bound[0].data_type == "float32-type"
+            np.testing.assert_array_equal(actual["output_0"], values[:, 0, 0, :5])
+            results.append((actual["output_0"], values[:, 0, 0, :5].copy()))
+            if static_outputs:
+                # The output slot is released after the call returns.
+                assert 0 not in bound_outputs
+
+        for actual, expected in results:
+            np.testing.assert_array_equal(actual, expected)
+        assert results[0][0] is not results[1][0]
+        first = ["bind_buffers"] if binding == "batch" else []
+        bound_output = [] if binding == "batch" else ["bind_output"]
+        per_call = (
+            [*first, *bound_output, "run", "request_output"]
+            if static_outputs
+            else [*first, "request_output", "run"]
+        )
+        assert events == per_call * 2
+    finally:
+        session.close()
 
 
 def test_older_projection_materializes_outputs_without_request_api(monkeypatch, mlir_target):
