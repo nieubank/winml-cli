@@ -198,15 +198,22 @@ class _Runtime(_Closable):
         self.token_rank = api.token_rank
         self.stage: _Stage | None = None
         self.pipeline: _Pipeline | None = None
+        self.targets: list[_Target] = []
         self.loaded: list[str] = []
         api.runtimes.append(self)
 
     def create_cpu_target(self) -> _Target:
-        return _Target("CPU")
+        if self._api.cpu_target_hresult is not None:
+            raise _WinMLError("CPU target creation failed", hresult=self._api.cpu_target_hresult)
+        target = _Target("CPU")
+        self.targets.append(target)
+        return target
 
     def create_target(self, kind: Any, preference: Any) -> _Target:
         assert preference is self._api.ExecutionTargetPreference.DEFAULT
-        return _Target(kind.name)
+        target = _Target(kind.name)
+        self.targets.append(target)
+        return target
 
     def load_model(self, path: str) -> _Closable:
         if self._api.load_hresult is not None:
@@ -275,7 +282,7 @@ class _TaskConfiguration(_Closable):
         assert self.bindings["output_index"] == 0
         assert self.bindings["output_kind"] == 0
         assert self.bindings["tokenizer"] is self.owner.api.tokenizers[0]
-        assert self.bindings["token_target"].kind.name == stage._target_kind
+        assert self.bindings["token_target"].kind.name == "CPU"
         self.validated = True
 
 
@@ -482,6 +489,7 @@ def _runtime_api(
         read_hresult=None,
         result_hresult=None,
         task_create_hresult=None,
+        cpu_target_hresult=None,
         result_token_mismatch=False,
         result_count_mismatch=False,
         result_prompt_offset=0,
@@ -591,9 +599,11 @@ class TestLoad:
         assert session.context_length == 64
 
     def test_gpu_uses_generic_gpu_target(self, tmp_path: Path) -> None:
-        session, _api = _session(tmp_path, device="gpu")
+        session, api = _session(tmp_path, device="gpu")
         session.load(context_length=16)
         assert session.effective_device == "gpu"
+        assert api.runtimes[0].stage._target_kind == "GPU"
+        assert api.configurations[0].bindings["token_target"].kind.name == "CPU"
 
     def test_gpu_without_backend_hresult_is_actionable(self, tmp_path: Path) -> None:
         session, _api = _session(tmp_path, device="gpu", load_hresult=0x80070032)
@@ -621,8 +631,11 @@ class TestLoad:
         with pytest.raises(LlamaLoadError, match="INT32 or INT64"):
             session.load()
 
-    def test_task_creation_failure_closes_acquired_resources(self, tmp_path: Path) -> None:
-        session, api = _session(tmp_path)
+    @pytest.mark.parametrize("device", ["cpu", "gpu"])
+    def test_task_creation_failure_closes_acquired_resources(
+        self, tmp_path: Path, device: str
+    ) -> None:
+        session, api = _session(tmp_path, device=device)
         api.task_create_hresult = 0x80004005
         with pytest.raises(LlamaLoadError, match="0x80004005"):
             session.load()
@@ -631,6 +644,7 @@ class TestLoad:
         assert api.tasks[0].closed
         assert api.runtimes[0].pipeline.closed
         assert api.runtimes[0].stage.closed
+        assert all(target.closed for target in api.runtimes[0].targets)
 
     def test_missing_native_tasks_library_is_actionable(self, tmp_path: Path) -> None:
         def missing_tasks(_runtime: Any) -> None:
@@ -647,6 +661,16 @@ class TestLoad:
         assert "Reinstall the matching preview" in str(excinfo.value)
         assert api.runtimes[0].pipeline.closed
         assert api.runtimes[0].stage.closed
+
+    def test_cpu_token_target_failure_closes_gpu_pipeline(self, tmp_path: Path) -> None:
+        session, api = _session(tmp_path, device="gpu")
+        api.cpu_target_hresult = 0x80004005
+        with pytest.raises(LlamaLoadError, match="0x80004005"):
+            session.load()
+        assert api.runtimes[0].pipeline.closed
+        assert api.runtimes[0].stage.closed
+        assert all(target.closed for target in api.runtimes[0].targets)
+        assert api.tasks == []
 
 
 # ---------------------------------------------------------------------------
@@ -828,8 +852,9 @@ class TestGenerateTimed:
 
 
 class TestClose:
-    def test_close_releases_handles_and_is_idempotent(self, tmp_path: Path) -> None:
-        session, api = _session(tmp_path)
+    @pytest.mark.parametrize("device", ["cpu", "gpu"])
+    def test_close_releases_handles_and_is_idempotent(self, tmp_path: Path, device: str) -> None:
+        session, api = _session(tmp_path, device=device)
         session.load(context_length=32)
         runtime = api.runtimes[0]
         pipeline, stage = runtime.pipeline, runtime.stage
@@ -840,6 +865,7 @@ class TestClose:
         assert runtime.closed
         assert pipeline.closed
         assert stage.closed
+        assert all(target.closed for target in runtime.targets)
         assert api.tokenizers[0].closed
         assert api.generation_sessions[0].closed
         assert api.generation_tasks[0].closed

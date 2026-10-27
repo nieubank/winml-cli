@@ -391,6 +391,7 @@ class WinMLLlamaSession:
         self._task: Any = None
         self._task_session: Any = None
         self._stage_target: Any = None
+        self._token_target: Any = None
         self._model: Any = None
         self._stage: Any = None
         self._pipeline: Any = None
@@ -469,7 +470,7 @@ class WinMLLlamaSession:
             self._wt = _import_tasks_api()
         wr, runtime = self._wr, self._runtime
         wt = self._wt
-        stage_target = model = builder = stage = pipeline = None
+        stage_target = token_target = model = builder = stage = pipeline = None
         tasks = configuration = task = task_session = None
         try:
             with _translate_native_errors("target creation", device=self._device):
@@ -496,6 +497,8 @@ class WinMLLlamaSession:
             effective_device = self._resolved_device(stage) or self._device
             task_start = time.perf_counter()
             with _translate_native_errors("Task creation", device=self._device):
+                # llama.cpp consumes host token IDs even when model execution uses a GPU.
+                token_target = runtime.create_cpu_target()
                 try:
                     tasks = wt.Tasks(runtime)
                 except FileNotFoundError as exc:
@@ -512,7 +515,7 @@ class WinMLLlamaSession:
                     output_index=0,
                     output_kind=wt.TextGenerationOutputKind.LOGITS,
                     state_owner_stage=stage,
-                    token_target=stage_target,
+                    token_target=token_target,
                     tokenizer=self._tokenizer,
                 )
                 configuration.validate()
@@ -529,12 +532,14 @@ class WinMLLlamaSession:
                 stage,
                 builder,
                 model,
+                token_target,
                 stage_target,
             ):
                 _close_quietly(resource)
             raise
 
         self._stage_target = stage_target
+        self._token_target = token_target
         self._model = model
         self._stage = stage
         self._pipeline = pipeline
@@ -558,6 +563,7 @@ class WinMLLlamaSession:
             "_pipeline",
             "_stage",
             "_model",
+            "_token_target",
             "_stage_target",
             "_runtime",
         ):
